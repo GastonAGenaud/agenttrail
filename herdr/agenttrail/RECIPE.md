@@ -1,6 +1,6 @@
 # Agenttrail
 
-Agenttrail Map, drawn natively beside your agents: the project as cards with connectors, each card's tasks and progress, which card an agent is on right now, and the path it took to get there. It opens as a panel on the right, expands to full size, and follows the repo of the focused terminal. The graph comes from the repo's `PLAN.md`; with no plan it falls back to a simple view of branches and worktrees from git, labelled as inferred. The mod only reads: it never writes to agents, plans, repos or settings.
+Agenttrail Map, drawn natively beside your agents: the project as cards with connectors, each card's tasks and progress, which card an agent is on right now, and the path it took to get there. It opens as a panel on the right, expands to full size, and follows the repo of the focused terminal. The graph comes from the repo's `PLAN.md`; with no plan it falls back to a simple view of branches and worktrees from git, labelled as inferred. Upstream the mod only reads; this fork can also send prompts to agents and add tasks to `PLAN.md`, always behind a confirm (see Acting).
 
 ![Agenttrail](preview.png)
 
@@ -80,3 +80,15 @@ One view, normally a 340px panel, full height, on Map's own colours rather than 
 - A repo with no `PLAN.md` shows the inferred note and a card per active branch, and adding a plan replaces them with the plan's cards.
 - Stopping a Map returns the view to `Map isn't running for <repo>` within about 6 seconds.
 - `debug` shows no render near 50 ms while sweeping zoom from fit to 180% and back.
+
+## Acting (this fork)
+
+This fork lets the Map act, which upstream deliberately does not. `act.js` holds the pure parts, tested in `test/act.test.mjs`.
+
+- **Select** a card, a task row or a run card: a panel opens at the bottom left (along the bottom under 1040px) with the target, its `by:` and the live Herdr agent it reaches.
+- **Who it reaches**: a hand pick (stored under `agenttrail.picks`), else an address, else the one agent in `agents()` whose tab, pane or title names hold every word of `by:` (`lead-terrapoint` finds `Lead TERRAPOINT · …`). An unclear name reaches no one, and the panel lists live agents to pick from. A run card matches the agent running that program in the run's folder.
+- **Actions**: Status, Seguí, Enfocar (`agent.focus`) and Prompt… Every send shows `¿Mandar a <tab> (<address>)?` with the exact text first; Confirmar reads the terminal (`hc read`), refuses if a permission dialog is on screen, and only then runs `hc send <address> <text>` (never forced). An agent Herdr reports as blocked shows `Necesita tu aprobación en su terminal` and Enfocar instead.
+- **Blocked**: a `[!]` task opens straight on the prompt. The tools bar shows `N bloqueadas`, which selects the first.
+- **Drag** a card to move it; its connectors follow. Offsets are kept per repo under `agenttrail.layout.<repo>`; `↺` in the tools bar puts every card back.
+- **+ Flujo** adds `- [ ] <title> {#<card>-<slug>}` (with `by:` if chosen, and `from: roadmap`) at the end of the chosen card in `PLAN.md`, written only if the file is unchanged since it was read. Map redraws it on its own.
+- **Commands**: `agenttrail.flow`, `agenttrail.stuck`, `agenttrail.close-panel`.
