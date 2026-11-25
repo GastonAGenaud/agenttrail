@@ -235,6 +235,8 @@ describe('the Map mod', () => {
       export const props = () => ({})
       export const exec = async () => ({ code: 1, stdout: '' })
       export const run = () => {}
+      export const agents = () => [], readTextFile = async () => null, writeTextFile = async () => null, Input = 0
+      export const InputState = { new: () => ({ on() {}, value: () => '', set_value() {}, focus() {}, blur() {} }) }
     `)
     const stub = pathToFileURL(path.join(dir, 'stub.mjs')).href
     const source = fs.readFileSync(path.join(mod, 'main.js'), 'utf8')

@@ -113,3 +113,12 @@ export function addTask(text, componentId, title, by = null) {
   lines.splice(end, 0, ...add);
   return { text: lines.join("\n"), id };
 }
+
+// by: names matched to a terminal address by hand, kept as plain strings.
+export function readPicks(raw) {
+  try {
+    const v = JSON.parse(raw ?? "{}");
+    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+    return Object.fromEntries(Object.entries(v).filter(([k, a]) => !(k in Object.prototype) && typeof a === "string"));
+  } catch { return {}; }
+}

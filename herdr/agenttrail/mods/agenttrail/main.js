@@ -1,12 +1,15 @@
 // Agenttrail Map drawn natively in Herdr. Docks as a side panel, expands to a
-// full view, and follows the repo of the focused terminal. Read-only: the only thing it
-// starts is a Map terminal, when asked. See graph.js for the layout, ported from the page.
+// full view, and follows the repo of the focused terminal. See graph.js for the layout,
+// ported from the page. This fork also acts: a card, task or session can send its agent a
+// prompt (after a confirm naming the terminal), cards can be dragged, and "+ Flujo" adds a
+// task to PLAN.md. See act.js.
 
 import { View, div, svg, image, PathBuilder } from "gpui-kit";
-import { h_flex, v_flex } from "gpui-base";
-import { appHome, exec, focused, home, layout, nextCommand, panes, props, run, settings, setShared, shared, spaces } from "herdr";
+import { h_flex, v_flex, InputState, Input } from "gpui-base";
+import { agents, appHome, exec, focused, home, layout, nextCommand, panes, props, readTextFile, run, settings, setShared, shared, spaces, writeTextFile } from "herdr";
 import * as fs from "fs/promises";
 import { Feed, POLL_MS, PORT_BASE, focusFolder, repoName } from "./feed.js";
+import { addTask, agentFor, agentForRun, looksLikeDialog, moveLayout, ownerOf, promptFor, readOffsets, readPicks } from "./act.js";
 import { REGION_HEAD, REGION_X, REGION_Y, ago, boardEdges, boardLayout, cardAgents, cardAge, cardCommits, cardLine, hostOf, inferredNote, kids, liveCard, openingCard, statusLabel, taskDetails, taskIsOpen, touched } from "./graph.js";
 
 const MOD = "agenttrail";
@@ -27,6 +30,13 @@ const MAX_ZOOM = 1.8;
 // detail rather than finish. Past this, task rows stop being drawn for that frame.
 const RENDER_BUDGET_MS = 28;
 const UNFOLD_AT = 1.05, FOLD_AT = 0.85; // zooming in opens every card, as on the page
+const PICKS = `${MOD}.picks`; // localStorage: by: names matched to a terminal by hand
+const LAYOUT = `${MOD}.layout.`; // localStorage, per repo: cards moved by hand
+const PANEL_W = 360;
+const store = {
+  get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem(key, value); } catch { /* a view without storage still works */ } },
+};
 
 // Map's own tokens (public/index.html :root), so the two read as one product.
 const DARK = { bg: "#000000", surface: "#181818", raised: "#1f1f1f", hover: "#272727", line: "#313131", text: "#ffffff", soft: "#d1d1d1", dim: "#9b9b9b", faint: "#686868", accent: "#e9a23b", danger: "#db6b67", success: "#7aa36a", done: "#3f7f57", completeText: "#70a784", completeBg: "#3f7f572e", region: "#18181880", overlay: "#181818", card: "#181818", cardLive: "#2f271c", cardHover: "#1f1f1f", human: "#5fb8c9", knowledge: "#a189e0", dot: "#31313159", openai: "#e8e8ea" };
@@ -68,6 +78,17 @@ export default class AgenttrailMap extends View {
     this.unfolded = false;
     this.ui = { open: new Set(), closed: new Set(), openTasks: new Set(), closedTasks: new Set() };
     this.press = null;
+    this.drag = null; // a card being moved: { id, x, y, dx, dy, moved }
+    this.offsets = {};
+    this.layoutKey = null;
+    this.moves = 0; // bumps when a card moves, so connectors are rebuilt
+    this.sel = null; // { kind: "node", id } or { kind: "run", run }
+    this.act = { mode: null, confirm: null, note: null, busy: false };
+    this.flow = null; // "+ Flujo": { comp } while the form is open
+    this.picks = readPicks(store.get(PICKS));
+    this.promptIn = InputState.new({ value: "" });
+    this.flowIn = InputState.new({ value: "" });
+    this.flowIn.on("submit", (_e, cx) => { this.addFlow(cx); });
     this.stats = { renders: 0, totalMs: 0, maxMs: 0, moves: 0, wheels: 0, worstNarrow: 0, worstFull: 0 };
     this.command = Array.isArray(p.command) && p.command.length && p.command.every((a) => typeof a === "string") ? p.command : START_COMMAND;
     this.starting = new Set();
@@ -91,6 +112,12 @@ export default class AgenttrailMap extends View {
         else if (command === "zoom-out") this.nudge(0.85);
         else if (command === "fit") { this.auto = false; this.fit(); }
         else if (command === "live") this.goLive();
+        else if (command === "flow") { if (this.feed.board) this.openFlow(this.feed.board); }
+        else if (command === "stuck") {
+          const b = this.feed.board, n = b?.plan.find((x) => x.level !== "component" && x.status === "blocked");
+          if (n) this.select({ kind: "node", id: n.id }, b);
+        }
+        else if (command === "close-panel") this.closePanel();
         // Sent to every shown copy, so each acts only where the word applies to it.
         else if (command === "expand") { if (!this.isExpanded(this.host())) this.toggleSize(); }
         else if (command === "collapse") { if (this.isExpanded(this.host())) this.toggleSize(); }
@@ -147,7 +174,8 @@ export default class AgenttrailMap extends View {
     this.edgeCache = null;
     if (!hasCards(b)) return;
     const now = Date.now();
-    const L = boardLayout(b, this.ui, now);
+    this.loadOffsets();
+    const L = moveLayout(boardLayout(b, this.ui, now), this.offsets);
     const width = REGION_X + L.width + 80, height = REGION_Y + L.height + REGION_HEAD + 80;
     this.minZoom = Math.max(0.06, Math.min(920 / width, 700 / height) * 0.75);
     this.geo = { L, ...boardEdges(b, L, now), region: { w: L.width, h: L.height + REGION_HEAD } };
@@ -350,7 +378,7 @@ export default class AgenttrailMap extends View {
   }
 
   edgeLayer(c) {
-    const key = `${this.zoom}|${lit()}`;
+    const key = `${this.zoom}|${lit()}|${this.moves}`;
     if (this.edgeCache?.key !== key) {
       const z = this.zoom;
       const trails = this.geo.trails.map((t) => {
@@ -444,7 +472,8 @@ export default class AgenttrailMap extends View {
     const live = touched(p, now);
     const tint = p.kind === "knowledge" ? c.knowledge : p.kind === "human" ? c.human : c.accent;
     const edge = p.kind === "knowledge" ? c.knowledge : p.kind === "human" ? c.human : p.status === "blocked" ? c.danger : open || live || p.status === "active" ? c.accent : c.line;
-    const strong = edge !== c.line;
+    const picked = this.sel?.kind === "node" && this.sel.id === p.id;
+    const strong = edge !== c.line || picked;
     const word = p.status === "done" ? "Revising" : p.status === "blocked" ? "Retrying" : "Editing";
     const names = cardAgents(b, p);
     const label = p.title.length > 28 ? `${p.title.slice(0, 27)}…` : p.title;
@@ -456,11 +485,16 @@ export default class AgenttrailMap extends View {
     const ports = [0, w].map((x) => div().absolute().left((x - 4) * z).top((h / 2 - 4) * z).w(8 * z).h(8 * z).rounded(8 * z).bg(c.raised).border(1).border_color(c.faint));
     return div().id(`n-${p.id}`).absolute()
       .left(this.pan.x + (REGION_X + pos.nodeX) * z).top(this.pan.y + (REGION_Y + REGION_HEAD + pos.nodeY) * z).w(w * z).h(h * z)
-      .rounded(12 * z).bg(live && !p.kind ? c.cardLive : c.card).border(strong ? 1.5 : 1).border_color(edge).cursor_pointer()
+      .rounded(12 * z).bg(live && !p.kind ? c.cardLive : c.card).border(picked ? 2.5 : strong ? 1.5 : 1).border_color(picked ? c.text : edge).cursor_pointer()
       .when(p.kind === "human", (el) => el.border_dashed())
-      .hover((s) => s.bg(c.cardHover).border_color(strong ? edge : c.faint))
-      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click((_e, cx) => { this.toggle(p); cx.notify(); })
+      .hover((s) => s.bg(c.cardHover).border_color(picked ? c.text : strong ? edge : c.faint))
+      .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.grab(p.id, e); })
+      .on_click((_e, cx) => {
+        if (this.dragged === p.id) { this.dragged = null; return; } // the end of a move, not a click
+        this.toggle(p);
+        this.select({ kind: "node", id: p.id }, b);
+        cx.notify();
+      })
       .child(this.text((p.tech || `#${p.id}`).slice(0, Math.min(42, Math.floor((w - 170) / 6.8))), { x: 16, y: 24, size: 11, color: p.kind ? tint : c.faint, mono: true, weight: 500 }))
       .children(this.statusIcon(c, p, w))
       .when(live, (el) => el
@@ -502,12 +536,15 @@ export default class AgenttrailMap extends View {
     const marker = this.rowMarker(c, task.status, String(i + 1));
     const pill = task.status === "done" ? ["Completed", c.completeText, c.completeBg] : task.status === "blocked" ? ["Blocked", c.danger, c.danger + "2e"] : null;
     const chip = task.by ? MARK[String(task.by).toLowerCase()] : null;
+    const picked = this.sel?.kind === "node" && this.sel.id === task.id;
     return v_flex().id(`t-${task.id}`).absolute().left(0).top(top * z).w(400 * z).h((44 + rows) * z).cursor_pointer()
+      .when(picked, (el) => el.bg(c.hover))
       .on_click((_e, cx) => {
         this.auto = false;
         if (open) { this.ui.openTasks.delete(task.id); this.ui.closedTasks.add(task.id); }
         else { this.ui.closedTasks.delete(task.id); this.ui.openTasks.add(task.id); }
         this.reshape();
+        this.select({ kind: "node", id: task.id }, b);
         cx.notify();
       })
       .child(h_flex().h(44 * z).px(8 * z).gap(8 * z).items_center().flex_none()
@@ -557,6 +594,238 @@ export default class AgenttrailMap extends View {
     ];
   }
 
+  // ---- cards moved by hand, kept per repo in this mod's localStorage.
+
+  loadOffsets() {
+    const key = `${LAYOUT}${this.feed.state.repo ?? this.feed.board?.project ?? ""}`;
+    if (key === this.layoutKey) return;
+    this.layoutKey = key;
+    this.offsets = readOffsets(store.get(key));
+    this.moves += 1;
+  }
+
+  grab(id, e) {
+    const o = this.offsets[id] ?? { dx: 0, dy: 0 };
+    this.drag = { id, x: e.position.x, y: e.position.y, dx: o.dx, dy: o.dy, moved: false };
+    this.dragged = null;
+  }
+
+  dragTo(e) {
+    const d = this.drag;
+    if (e.pressed_button !== "left") return this.drop(); // released outside the window
+    const mx = (e.position.x - d.x) / this.zoom, my = (e.position.y - d.y) / this.zoom;
+    if (!d.moved && Math.hypot(mx * this.zoom, my * this.zoom) < 4) return;
+    d.moved = true;
+    this.auto = false;
+    this.offsets = { ...this.offsets, [d.id]: { dx: d.dx + mx, dy: d.dy + my } };
+    this.moves += 1;
+    this.reshape();
+  }
+
+  drop() {
+    const d = this.drag;
+    this.drag = null;
+    if (!d?.moved) return;
+    this.dragged = d.id; // the click that ends a move doesn't open the card
+    this.offsets = readOffsets(JSON.stringify(this.offsets));
+    store.set(this.layoutKey, JSON.stringify(this.offsets));
+  }
+
+  resetMoves() {
+    this.offsets = {};
+    this.moves += 1;
+    store.set(this.layoutKey, "{}");
+    this.reshape();
+  }
+
+  // ---- acting: who a selection reaches, and the confirm before anything is sent.
+
+  panelOpen() {
+    return Boolean(this.sel || this.flow);
+  }
+
+  selNode(b) {
+    return this.sel?.kind === "node" ? b.plan.find((n) => n.id === this.sel.id) ?? null : null;
+  }
+
+  target(b) {
+    const live = agents();
+    if (this.sel?.kind === "run") return { by: this.sel.run.agent, agent: agentForRun(this.sel.run, live, panes(), this.picks) };
+    const by = ownerOf(b, this.sel);
+    return { by, agent: agentFor(by, live, this.picks) };
+  }
+
+  select(sel, b) {
+    this.flow = null;
+    this.sel = sel;
+    this.act = { mode: null, confirm: null, note: null, busy: false };
+    if (this.selNode(b)?.status === "blocked") this.openPrompt(); // a stuck task opens on the prompt that unsticks it
+  }
+
+  closePanel() {
+    this.sel = null;
+    this.flow = null;
+    this.promptIn.blur();
+    this.flowIn.blur();
+  }
+
+  openPrompt() {
+    this.act.mode = "prompt";
+    this.act.confirm = null;
+    this.promptIn.set_value("");
+    this.promptIn.focus();
+  }
+
+  pick(by, address) {
+    this.picks = { ...this.picks, [String(by).toLowerCase()]: address };
+    store.set(PICKS, JSON.stringify(this.picks));
+  }
+
+  ask(kind, b) {
+    const { agent } = this.target(b);
+    const text = promptFor(kind, this.selNode(b), kind === "free" ? this.promptIn.value() : "");
+    if (!agent || !text) return;
+    this.act.confirm = { text, address: agent.address, name: agent.tab_name || agent.pane_name || agent.address };
+    this.act.note = null;
+  }
+
+  // The terminal's screen is read first: a dialog there is the person's to answer, and
+  // `hc send` without its force flag refuses to type into one anyway.
+  send(cx) {
+    const cf = this.act.confirm;
+    if (!cf || this.act.busy) return;
+    this.act.busy = true;
+    cx.spawn(async (cx) => {
+      let note;
+      try {
+        const screen = await exec("hc", ["read", cf.address, "--lines", "25"], { timeout: 10000 });
+        if (looksLikeDialog(screen.stdout)) note = { bad: true, text: `${cf.name} tiene un diálogo abierto: aprobalo en su terminal.` };
+        else {
+          const r = await exec("hc", ["send", cf.address, cf.text], { timeout: 20000 });
+          note = r.code === 0 ? { bad: false, text: `Enviado a ${cf.name} (${cf.address}).` } : { bad: true, text: (r.stderr || r.stdout).trim().slice(0, 200) || `hc send salió con ${r.code}` };
+        }
+      } catch (err) {
+        note = { bad: true, text: String(err?.message ?? err).slice(0, 200) };
+      }
+      this.act = { mode: note.bad ? this.act.mode : null, confirm: null, note, busy: false };
+      if (!note.bad) this.promptIn.set_value("");
+      cx.notify();
+    });
+  }
+
+  openFlow(b) {
+    const comps = b.plan.filter((n) => n.level === "component");
+    const node = this.selNode(b);
+    const here = node ? (node.level === "component" ? node.id : node.parent) : null;
+    this.sel = null;
+    this.flow = { comp: here ?? comps[0]?.id ?? null, by: null, note: null, busy: false };
+    this.flowIn.set_value("");
+    this.flowIn.focus();
+  }
+
+  // Written only if PLAN.md is still what was read: Map redraws it on its own.
+  addFlow(cx) {
+    const f = this.flow;
+    const repo = this.feed.state.repo;
+    if (!f || f.busy || !repo || !f.comp || !this.flowIn.value().trim()) return;
+    f.busy = true;
+    cx.spawn(async (cx) => {
+      const file = `${repo}/PLAN.md`;
+      try {
+        const before = await readTextFile(file);
+        const next = before == null ? null : addTask(before, f.comp, this.flowIn.value(), f.by);
+        if (!next) f.note = { bad: true, text: "No encontré esa tarjeta en PLAN.md." };
+        else {
+          await writeTextFile(file, next.text, before);
+          f.note = { bad: false, text: `Agregada {#${next.id}} en PLAN.md.` };
+          this.flowIn.set_value("");
+          this.wake?.();
+        }
+      } catch (err) {
+        f.note = { bad: true, text: `PLAN.md cambió o no se pudo escribir: ${String(err?.message ?? err).slice(0, 120)}` };
+      }
+      f.busy = false;
+      cx.notify();
+    });
+  }
+
+  chip(c, id, text, action, { tone = c.dim, solid = false, off = false } = {}) {
+    return div().id(id).h(28).px(10).flex().flex_none().items_center().rounded(8).border(1).border_color(solid ? tone : c.line)
+      .bg(solid ? tone : c.surface).text_size(12).font_weight(600).text_color(solid ? "#141414" : off ? c.faint : tone)
+      .when(!off, (el) => el.cursor_pointer().hover((s) => s.bg(solid ? tone : c.hover)).on_click(action)).child(text);
+  }
+
+  panel(c, b, now) {
+    const low = (this.size?.width ?? 0) < SIDE_DOCK;
+    const box = v_flex().id("act").absolute().p(14).gap(10).rounded(14).border(1).border_color(c.line).bg(c.overlay).shadow_lg()
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation());
+    const placed = low ? box.left(8).right(8).bottom(8) : box.left(24).bottom(24).w(PANEL_W);
+    const head = (title, sub) => h_flex().gap(8).items_start()
+      .child(v_flex().flex_1().min_w(0).child(div().truncate().text_size(13.5).font_weight(600).text_color(c.text).child(title))
+        .when(Boolean(sub), (el) => el.child(div().truncate().text_size(11.5).font_family(MONO).text_color(c.faint).child(sub))))
+      .child(this.tool(c, "act-close", "×", (_e, cx) => { this.closePanel(); cx.notify(); }));
+    const note = (n) => div().text_size(12).text_color(n.bad ? c.danger : c.success).child(n.text);
+    const field = (state) => Input.new(state).h(34).px(10).rounded(8).border(1).border_color(c.accent).bg(c.bg).text_size(12.5).text_color(c.text);
+    if (this.flow) return placed.child(this.flowForm(c, b, head, note, field));
+    const node = this.selNode(b);
+    const run = this.sel?.kind === "run" ? this.sel.run : null;
+    if (!node && !run) return div();
+    const { by, agent } = this.target(b);
+    const stuck = agent?.status === "blocked";
+    const title = node ? node.title : `${run.agent} · sesión`;
+    const sub = node ? `#${node.id} · ${statusLabel(node.status)}${by ? ` · by: ${by}` : ""}` : `${ago(run.startedAt, now)} · ${shortPath(run.cwd)}`;
+    const cf = this.act.confirm;
+    const choices = agents().slice(0, 8);
+    return placed
+      .child(head(title, sub))
+      .child(agent
+        ? h_flex().gap(6).items_center().text_size(12).text_color(c.dim)
+          .child(div().w(7).h(7).rounded(7).flex_none().bg(stuck ? c.danger : agent.status === "working" ? c.accent : agent.status === "done" ? c.success : c.faint))
+          .child(div().flex_1().min_w(0).truncate().child(`→ ${agent.tab_name || agent.address} · ${agent.address} · ${agent.status}`))
+        : v_flex().gap(6).child(div().text_size(12).text_color(c.dim).child(by ? `Ningún agente vivo para by: ${by}. Elegí uno:` : "Esta tarjeta no dice quién la hace (by:)."))
+          .when(Boolean(by), (el) => el.child(h_flex().flex_wrap().gap(6).children(choices.map((a) =>
+            this.chip(c, `pick-${a.address}`, a.tab_name || a.address, (_e, cx) => { this.pick(by, a.address); cx.notify(); }))))))
+      .when(stuck, (el) => el.child(h_flex().gap(8).items_center()
+        .child(div().flex_1().text_size(12).text_color(c.danger).child("Necesita tu aprobación en su terminal."))
+        .child(this.chip(c, "focus-stuck", "Enfocar", (_e, cx) => { run("agent.focus", { terminal: agent.address }); cx.notify(); }, { tone: c.danger }))))
+      .when(Boolean(agent) && !stuck && !cf, (el) => el.child(h_flex().flex_wrap().gap(6)
+        .child(this.chip(c, "a-status", "Status", (_e, cx) => { this.ask("status", b); cx.notify(); }))
+        .child(this.chip(c, "a-next", "Seguí", (_e, cx) => { this.ask("next", b); cx.notify(); }))
+        .child(this.chip(c, "a-focus", "Enfocar", (_e, cx) => { run("agent.focus", { terminal: agent.address }); cx.notify(); }))
+        .child(this.chip(c, "a-prompt", "Prompt…", (_e, cx) => { this.openPrompt(); cx.notify(); }, { tone: c.accent }))))
+      .when(Boolean(agent) && !stuck && !cf && this.act.mode === "prompt", (el) => el.child(h_flex().gap(6).items_center()
+        .child(div().flex_1().min_w(0).child(field(this.promptIn)))
+        .child(this.chip(c, "a-free", "Enviar", (_e, cx) => { this.ask("free", b); cx.notify(); }, { tone: c.accent, solid: true }))))
+      .when(Boolean(cf), (el) => el.child(v_flex().gap(8).p(10).rounded(10).bg(c.surface)
+        .child(div().text_size(12).text_color(c.text).child(`¿Mandar a ${cf.name} (${cf.address})?`))
+        .child(div().text_size(11.5).font_family(MONO).text_color(c.dim).child(cf.text.length > 220 ? `${cf.text.slice(0, 219)}…` : cf.text))
+        .child(h_flex().gap(6).justify_end()
+          .child(this.chip(c, "a-cancel", "Cancelar", (_e, cx) => { this.act.confirm = null; cx.notify(); }))
+          .child(this.chip(c, "a-send", this.act.busy ? "Enviando…" : "Confirmar", (_e, cx) => { this.send(cx); cx.notify(); }, { tone: c.accent, solid: true, off: this.act.busy })))))
+      .when(Boolean(this.act.note), (el) => el.child(note(this.act.note)));
+  }
+
+  flowForm(c, b, head, note, field) {
+    const f = this.flow;
+    const comps = b.plan.filter((n) => n.level === "component");
+    const bys = [...new Set(b.plan.filter((n) => n.by).map((n) => n.by))].slice(0, 8);
+    const label = (t) => div().text_size(11).font_family(MONO).font_weight(500).text_color(c.faint).child(t);
+    return v_flex().gap(10)
+      .child(head("+ Flujo", "Agrega una tarea a PLAN.md"))
+      .child(label("TARJETA"))
+      .child(h_flex().flex_wrap().gap(6).children(comps.map((p) =>
+        this.chip(c, `fc-${p.id}`, p.title.length > 22 ? `${p.title.slice(0, 21)}…` : p.title, (_e, cx) => { f.comp = p.id; cx.notify(); }, { tone: f.comp === p.id ? c.accent : c.dim }))))
+      .child(label("QUIÉN (by:)"))
+      .child(h_flex().flex_wrap().gap(6)
+        .child(this.chip(c, "fb-none", "nadie", (_e, cx) => { f.by = null; cx.notify(); }, { tone: f.by ? c.dim : c.accent }))
+        .children(bys.map((n) => this.chip(c, `fb-${n}`, n, (_e, cx) => { f.by = n; cx.notify(); }, { tone: f.by === n ? c.accent : c.dim }))))
+      .child(label("TAREA"))
+      .child(h_flex().gap(6).items_center()
+        .child(div().flex_1().min_w(0).child(field(this.flowIn)))
+        .child(this.chip(c, "f-add", f.busy ? "…" : "Agregar", (_e, cx) => { this.addFlow(cx); cx.notify(); }, { tone: c.accent, solid: true, off: f.busy })))
+      .when(Boolean(f.note), (el) => el.child(note(f.note)));
+  }
+
   // ---- overlays: fixed to the pane, like the page's.
 
   tool(c, id, child, action) {
@@ -565,6 +834,7 @@ export default class AgenttrailMap extends View {
   }
 
   tools(c, b, now) {
+    const stuck = b.plan.filter((n) => n.level !== "component" && n.status === "blocked");
     const inset = this.narrow() ? 8 : 24;
     return h_flex().id("tools").absolute().left(inset).top(inset).p(4).gap(4).items_center().rounded(12).border(1).border_color(c.line).bg(c.overlay).shadow_lg()
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -573,7 +843,14 @@ export default class AgenttrailMap extends View {
       .child(this.tool(c, "zoom-in", "+", (_e, cx) => { this.nudge(1.18); cx.notify(); }))
       .child(div().w(1).h(16).mx(4).bg(c.line))
       .child(this.tool(c, "fit", svg(`${ASSET}/fit.svg`).w(14).h(14), (_e, cx) => { this.auto = false; this.fit(); cx.notify(); }))
-      .when(Boolean(liveCard(b, now)), (el) => el.child(this.tool(c, "live", svg(`${ASSET}/live.svg`).w(14).h(14), (_e, cx) => { this.goLive(); cx.notify(); })));
+      .when(Boolean(liveCard(b, now)), (el) => el.child(this.tool(c, "live", svg(`${ASSET}/live.svg`).w(14).h(14), (_e, cx) => { this.goLive(); cx.notify(); })))
+      .when(Object.keys(this.offsets).length > 0, (el) => el.child(this.tool(c, "unmove", "↺", (_e, cx) => { this.resetMoves(); cx.notify(); })))
+      .child(div().w(1).h(16).mx(4).bg(c.line))
+      .when(stuck.length > 0, (el) => el.child(div().id("stuck").h(28).px(8).flex().items_center().rounded(8).text_size(12).font_weight(600).text_color(c.danger).cursor_pointer()
+        .hover((s) => s.bg(c.hover)).on_click((_e, cx) => { this.select({ kind: "node", id: stuck[0].id }, b); cx.notify(); })
+        .child(`${stuck.length} ${stuck.length === 1 ? "bloqueada" : "bloqueadas"}`)))
+      .child(div().id("flow").h(28).px(8).flex().items_center().rounded(8).text_size(12).font_weight(600).text_color(c.accent).cursor_pointer()
+        .hover((s) => s.bg(c.hover)).on_click((_e, cx) => { this.openFlow(b); cx.notify(); }).child("+ Flujo"));
   }
 
   runCard(c, b, r, now) {
@@ -581,7 +858,10 @@ export default class AgenttrailMap extends View {
     const tool = r.currentTool ?? r.recentTools?.[0];
     const comp = r.componentId ? b.plan.find((x) => x.id === r.componentId) : null;
     const key = own(MARK, String(r.agent).toLowerCase());
-    return v_flex().px(14).py(12).rounded(14).border(1).border_color(c.line).bg(c.overlay).shadow_lg().flex_none()
+    const picked = this.sel?.kind === "run" && this.sel.run.id === r.id;
+    return v_flex().id(`run-${r.id ?? r.startedAt}`).px(14).py(12).rounded(14).border(picked ? 1.5 : 1).border_color(picked ? c.accent : c.line).bg(c.overlay).shadow_lg().flex_none()
+      .cursor_pointer().hover((s) => s.border_color(c.faint))
+      .on_click((_e, cx) => { this.select({ kind: "run", run: r }, b); cx.notify(); })
       .child(h_flex().gap(8).items_center()
         .child(key ? svg(`${ASSET}/agent-${key}.svg`).w(16).h(16).flex_none().text_color(agentColor(c, r.agent)) : div().w(16).h(16).flex_none())
         .child(div().flex_none().text_size(13).font_weight(600).text_color(c.text).child(r.agent))
@@ -766,6 +1046,8 @@ export default class AgenttrailMap extends View {
           cx.notify();
         })
         .on_mouse_up("left", (_e, cx) => { this.press = null; cx.notify(); })
+        .on_window_mouse_move((e, cx) => { if (this.drag) { this.dragTo(e); cx.notify(); } })
+        .on_window_mouse_up("left", (_e, cx) => { if (this.drag) { this.drop(); cx.notify(); } })
         .on_hover((hovered, cx) => { if (!hovered && this.press) { this.press = null; cx.notify(); } })
         .on_scroll_wheel((e, cx) => {
           this.stats.wheels += 1;
@@ -777,7 +1059,9 @@ export default class AgenttrailMap extends View {
           cx.notify();
         })
         .when(ready, (el) => { const g = el.child(this.grid(c)); this.parts.grid = Date.now() - this.t0; return g; })
-        .when(ready, (el) => el.children(this.canvas(c, b, now)).child(this.tools(c, b, now)).child(this.runs(c, b, now)))
+        .when(ready, (el) => el.children(this.canvas(c, b, now)).child(this.tools(c, b, now)))
+        .when(ready && !(this.panelOpen() && (this.size?.width ?? 0) < SIDE_DOCK), (el) => el.child(this.runs(c, b, now)))
+        .when(ready && this.panelOpen(), (el) => el.child(this.panel(c, b, now)))
         .when(Boolean(b) && !hasCards(b), (el) => el.child(this.noPlan(c, b, now)))
         .when(!b, (el) => el.child(this.notice(c, this.feed.state))));
     const ms = Date.now() - started;
