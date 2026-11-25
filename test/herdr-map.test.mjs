@@ -358,26 +358,35 @@ describe('the Map mod', () => {
 
   test('the pure modules import nothing from Herdr', () => {
     const dir = path.join(ROOT, 'herdr', 'agenttrail', 'mods', 'agenttrail')
-    for (const file of ['feed.js', 'graph.js']) assert.ok(!/from "(herdr|gpui)/.test(fs.readFileSync(path.join(dir, file), 'utf8')), file)
+    for (const file of ['feed.js', 'graph.js', 'act.js']) assert.ok(!/from "(herdr|gpui)/.test(fs.readFileSync(path.join(dir, file), 'utf8')), file)
   })
 
   test('no timer redraws: the clock only moves with the poll', () => {
     const dir = path.join(ROOT, 'herdr', 'agenttrail', 'mods', 'agenttrail')
-    for (const file of ['main.js', 'feed.js', 'graph.js']) assert.ok(!/setTimeout|setInterval|timer\.every/.test(fs.readFileSync(path.join(dir, file), 'utf8')), file)
+    for (const file of ['main.js', 'feed.js', 'graph.js', 'act.js']) assert.ok(!/setTimeout|setInterval|timer\.every/.test(fs.readFileSync(path.join(dir, file), 'utf8')), file)
   })
 
-  test('the mod never writes to Map', () => {
+  test('the mod never writes to Map, and reaches agents only through hc read and hc send', () => {
     const dir = path.join(ROOT, 'herdr', 'agenttrail', 'mods', 'agenttrail')
-    for (const file of ['main.js', 'feed.js', 'graph.js']) {
+    for (const file of ['main.js', 'feed.js', 'graph.js', 'act.js']) {
       const text = fs.readFileSync(path.join(dir, file), 'utf8')
       assert.ok(!/method:\s*["']POST/.test(text), file)
-      for (const call of text.match(/\bexec\(.*/g) ?? []) assert.match(call, /^exec\("git", \["rev-parse", "--show-toplevel"\]/, file)
+      assert.ok(!/--force/.test(text), `${file} must never answer an agent's dialog`)
+      for (const call of text.match(/\bexec\(.*/g) ?? []) assert.match(call, /^exec\("(git", \["rev-parse", "--show-toplevel"\]|hc", \["(read|send)", cf\.address)/, file)
     }
   })
 
-  test('the only command the mod sends that starts anything is the Map terminal', () => {
+  test('a send waits for its confirm and reads the screen first', () => {
     const text = fs.readFileSync(path.join(ROOT, 'herdr', 'agenttrail', 'mods', 'agenttrail', 'main.js'), 'utf8')
-    assert.deepEqual([...new Set(text.match(/\brun\("[a-z.]+"/g))].sort(), ['run("pane.zoom"', 'run("tab.close"', 'run("tab.new"', 'run("tab.select"', 'run("terminal.open"'])
+    const send = text.slice(text.indexOf('  send(cx) {'), text.indexOf('  openFlow('))
+    assert.match(send, /const cf = this\.act\.confirm;\s*if \(!cf/)
+    assert.ok(send.indexOf('"read"') < send.indexOf('"send"'))
+    assert.match(send, /looksLikeDialog\(screen\.stdout\)/)
+  })
+
+  test('the only command the mod sends that starts anything is the Map terminal, besides focusing an agent', () => {
+    const text = fs.readFileSync(path.join(ROOT, 'herdr', 'agenttrail', 'mods', 'agenttrail', 'main.js'), 'utf8')
+    assert.deepEqual([...new Set(text.match(/\brun\("[a-z.]+"/g))].sort(), ['run("agent.focus"', 'run("pane.zoom"', 'run("tab.close"', 'run("tab.new"', 'run("tab.select"', 'run("terminal.open"'])
     // Pinned to this release: a press runs the Map this mod was tested with, never whatever npm has that day.
     const { version } = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
     assert.ok(text.includes(`START_COMMAND = ["npx", "-y", "agenttrail@${version}"]`), `Start Map here must run agenttrail@${version}, the version in package.json`)
